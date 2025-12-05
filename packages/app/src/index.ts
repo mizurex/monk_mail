@@ -1,9 +1,8 @@
-// src/webhook-server.ts
 import * as https from 'https';
-import express from 'express';
-import crypto from 'crypto';
+import * as tls from 'tls';
 
 /* ---------------- Monkmail (Telegram sender) ---------------- */
+
 export interface MonkmailConfig {
     botToken: string;
     chatId: string;
@@ -27,179 +26,315 @@ export class Monkmail {
             text: message,
         });
 
-        const requestOptions: https.RequestOptions = {
-            hostname: 'api.telegram.org',
-            port: 443,
-            path: `/bot${botToken}/sendMessage`,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(payload),
-            },
-        };
-
         return new Promise((resolve, reject) => {
-            const req = https.request(requestOptions, (res) => {
-                let body = '';
-                res.on('data', (chunk) => (body += chunk));
-                res.on('end', () => {
-                    if (res.statusCode === 200) {
-                        resolve();
-                    } else {
-                        reject(new Error(`Telegram error ${res.statusCode}: ${body}`));
-                    }
-                });
-            });
+            const req = https.request(
+                {
+                    hostname: 'api.telegram.org',
+                    port: 443,
+                    path: `/bot${botToken}/sendMessage`,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Length': Buffer.byteLength(payload),
+                    },
+                },
+                (res) => {
+                    let body = '';
+                    res.on('data', (c) => (body += c));
+                    res.on('end', () => {
+                        if (res.statusCode === 200) resolve();
+                        else reject(new Error(`Telegram error ${res.statusCode}: ${body}`));
+                    });
+                }
+            );
 
-            req.on('error', (err) => reject(new Error(`Network error: ${err.message}`)));
+            req.on('error', (err) => reject(err));
             req.write(payload);
             req.end();
         });
     }
 }
 
-/* ---------------- Webhook server ---------------- */
+/* ---------------- SMTP client ---------------- */
 
-const PORT = Number(process.env.PORT || 80); // set PORT env if you don't want to run on 80
-const GITHUB_WEBHOOK_SECRET = "1377743400"; // leave empty to skip verification
-const TELEGRAM_BOT_TOKEN = "8514650405:AAFzBuEQxw83GnvP3mmTnnKyCFjwmiObB0M"; // or fill directly below
-const TELEGRAM_CHAT_ID = "1377743400";
-
-if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.error('Please set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (env or edit file).');
-    process.exit(1);
+export interface SmtpConfig {
+    host: string;
+    port: number;
+    username: string;
+    password: string;
+    from: string;
 }
 
-const mailer = new Monkmail({ botToken: TELEGRAM_BOT_TOKEN, chatId: TELEGRAM_CHAT_ID });
+export class SmtpClient {
+    private config: SmtpConfig;
 
-// helper to verify signature header (X-Hub-Signature-256)
-function verifySignature(secret: string, payload: Buffer, signatureHeader?: string) {
-    if (!secret) return true; // if no secret configured, skip verification (convenience for dev)
-    if (!signatureHeader) return false;
-    const hmac = crypto.createHmac('sha256', secret);
-    hmac.update(payload);
-    const digest = `sha256=${hmac.digest('hex')}`;
-    try {
-        return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signatureHeader));
-    } catch {
-        return false;
+    constructor(config: SmtpConfig) {
+        this.config = config;
+    }
+
+    async sendEmail(to: string, subject: string, textBody: string): Promise<void> {
+        const { host, port, username, password, from } = this.config;
+
+        const emailData =
+            `From: ${from}\r\n` +
+            `To: <${to}>\r\n` +
+            `Subject: ${subject}\r\n\r\n` +
+            textBody;
+
+        await new Promise<void>((resolve, reject) => {
+            const socket = tls.connect(
+                {
+                    host,
+                    port,
+                    servername: host, // SNI, safer for Gmail
+                },
+                () => {
+                    (async () => {
+                        try {
+                            // 220 greeting
+                            let resp = await this.read(socket);
+                            this.expectCode(resp, '220', 'greeting');
+
+                            // EHLO
+                            resp = await this.cmd(socket, `EHLO localhost\r\n`);
+                            this.expectCode(resp, '250', 'EHLO');
+
+                            // AUTH LOGIN
+                            resp = await this.cmd(socket, `AUTH LOGIN\r\n`);
+                            this.expectCode(resp, '334', 'AUTH LOGIN (username prompt)');
+
+                            // username
+                            resp = await this.cmd(
+                                socket,
+                                `${Buffer.from(username, 'utf8').toString('base64')}\r\n`
+                            );
+                            this.expectCode(resp, '334', 'AUTH LOGIN (password prompt)');
+
+                            // password
+                            resp = await this.cmd(
+                                socket,
+                                `${Buffer.from(password, 'utf8').toString('base64')}\r\n`
+                            );
+                            this.expectCode(resp, '235', 'AUTH success');
+
+                            // MAIL FROM
+                            resp = await this.cmd(
+                                socket,
+                                `MAIL FROM:<${this.extractAddress(from)}>\r\n`
+                            );
+                            this.expectCode(resp, '250', 'MAIL FROM');
+
+                            // RCPT TO
+                            resp = await this.cmd(socket, `RCPT TO:<${to}>\r\n`);
+                            this.expectCode(resp, '250', 'RCPT TO');
+
+                            // DATA
+                            resp = await this.cmd(socket, `DATA\r\n`);
+                            this.expectCode(resp, '354', 'DATA');
+
+                            // message + terminator
+                            resp = await this.cmd(socket, `${emailData}\r\n.\r\n`);
+                            this.expectCode(resp, '250', 'end of DATA');
+
+                            // QUIT (ignore code)
+                            await this.cmd(socket, `QUIT\r\n`);
+
+                            resolve();
+                        } catch (e) {
+                            reject(e);
+                        } finally {
+                            socket.end();
+                        }
+                    })();
+                }
+            );
+
+            socket.on('error', (err) => reject(err));
+        });
+    }
+
+    private read(socket: tls.TLSSocket): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const onData = (d: Buffer) => {
+                socket.removeListener('error', onError);
+                resolve(d.toString());
+            };
+            const onError = (err: Error) => {
+                socket.removeListener('data', onData);
+                reject(err);
+            };
+
+            socket.once('data', onData);
+            socket.once('error', onError);
+        });
+    }
+
+    private async cmd(socket: tls.TLSSocket, str: string): Promise<string> {
+        socket.write(str);
+        const resp = await this.read(socket);
+        // Uncomment this to debug SMTP conversation:
+        // console.log('SMTP RESP:', resp.trim());
+        return resp;
+    }
+
+    private expectCode(response: string, expected: string, step: string) {
+        const code = response.slice(0, 3);
+        if (code !== expected) {
+            throw new Error(
+                `SMTP error at ${step}: expected ${expected}, got ${code}. Full response:\n${response}`
+            );
+        }
+    }
+
+    private extractAddress(from: string): string {
+        const m = from.match(/<(.*?)>/);
+        return m ? m[1] : from;
     }
 }
 
-const app = express();
+/* ---------------- GitHub Webhook (NO signature checking) ---------------- */
 
-// get raw body so signature verification works
-app.use(
-    express.raw({
-        type: 'application/json',
-        limit: '2mb',
-    })
-);
+export interface GithubWebhookOptions {
+    rawBody: Buffer;
+    event?: string;
+}
 
-app.post('/webhook', async (req: any, res: any) => {
-    const raw = req.body as Buffer;
-    const sig = req.headers['x-hub-signature-256'] as string | undefined;
-
-    if (!verifySignature(GITHUB_WEBHOOK_SECRET, raw, sig)) {
-        console.warn('Invalid signature for incoming webhook');
-        res.status(401).send('invalid signature');
-        return;
-    }
+/**
+ * monkHandler:
+ */
+export async function monkHandler(
+    { rawBody, event }: GithubWebhookOptions,
+    send: (text: string) => Promise<void>
+): Promise<void> {
+    if (!rawBody) throw new Error('rawBody required');
 
     let payload: any;
     try {
-        payload = JSON.parse(raw.toString('utf8'));
-    } catch (err) {
-        console.error('Failed to parse JSON', err);
-        res.status(400).send('invalid json');
-        return;
+        payload = JSON.parse(rawBody.toString('utf8'));
+    } catch {
+        throw new Error('Invalid JSON');
     }
 
-    const event = req.headers['x-github-event'] as string | undefined;
-    console.log('Received GitHub event', event);
-
-    try {
-        if (event === 'workflow_run') {
-            await handleWorkflowRun(payload);
-        } else if (event === 'pull_request') {
-            await handlePullRequest(payload);
-        } else if (event === 'issues') {
-            await handleIssue(payload);
-        } else if (event === 'push') {
-            await handlePush(payload);
-        } else {
-            console.log('Unhandled event:', event);
-        }
-
-        res.status(200).send('ok');
-    } catch (err: any) {
-        console.error('Handler error:', err);
-        res.status(500).send('handler error');
+    switch (event) {
+        case 'workflow_run':
+            return handleWorkflowRun(payload, send);
+        case 'pull_request':
+            return handlePullRequest(payload, send);
+        case 'issues':
+            return handleIssue(payload, send);
+        case 'push':
+            return handlePush(payload, send);
+        default:
+            return safeSend(send, buildGenericGithubMessage(event, payload));
     }
-});
+}
 
-app.listen(PORT, () => {
-    console.log(`Webhook server listening on ${PORT}`);
-});
+const ANIMALS = [
+    // bunny
+    String.raw`(\_/)
+( •_•)
+/ >💌`,
+    // cat
+    String.raw` /\_/\
+( o.o )
+ > ^ <`,
+    // bear
+    String.raw`ʕ•ᴥ•ʔ`,
+    // duck
+    String.raw`<(° )~`,
+    // chill blob
+    String.raw`(・_・;)`
+];
 
-/* ---------------- Handlers (plain text messages) ---------------- */
+function randomAnimal(): string {
+    const idx = Math.floor(Math.random() * ANIMALS.length);
+    return ANIMALS[idx];
+}
 
-async function handleWorkflowRun(payload: any) {
+const SEP = '────────────────────────';
+
+function headerLine(label: string, repoName?: string) {
+    return `┏ ${label}${repoName ? ` • ${repoName}` : ''}\n${SEP}`;
+}
+
+/* ---------------- GitHub handlers ---------------- */
+
+async function handleWorkflowRun(payload: any, send: (t: string) => Promise<void>) {
     const run = payload.workflow_run;
     const repo = payload.repository;
-    const workflowName = payload.workflow || run.name || 'workflow';
-    const conclusion = run.conclusion || 'unknown';
-    const htmlUrl = run.html_url || run.html_url || '';
-    const branch = run.head_branch || run.head_commit?.ref || 'unknown';
-    const actor = run.actor?.login || payload.sender?.login || 'unknown';
 
-    const message =
-        `${repo.full_name} - Workflow "${workflowName}" finished with status: ${conclusion}\n` +
-        `Branch: ${branch}\n` +
-        `By: ${actor}\n` +
-        `View: ${htmlUrl}`;
+    const workflowName = run?.name || payload.workflow?.name || 'workflow';
+    const conclusion = run?.conclusion || 'unknown';
+    const branch = run?.head_branch || run?.head_commit?.ref || 'unknown';
+    const actor = run?.actor?.login || payload.sender?.login || 'unknown';
+    const htmlUrl = run?.html_url || repo?.html_url || '';
 
-    console.log('workflow_run ->', message);
-    await safeSend(message);
+    const art = randomAnimal();
+
+    const msg =
+        `${art}\n` +
+        `${headerLine('Workflow', repo?.full_name)}\n` +
+        `Name   : ${workflowName}\n` +
+        `Status : ${conclusion}\n` +
+        `Branch : ${branch}\n` +
+        `By     : ${actor}\n` +
+        (htmlUrl ? `View   : ${htmlUrl}\n` : '') +
+        SEP;
+
+    await safeSend(send, msg);
 }
 
-async function handlePullRequest(payload: any) {
-    const action = payload.action || 'unknown';
+async function handlePullRequest(payload: any, send: (t: string) => Promise<void>) {
     const pr = payload.pull_request;
     const repo = payload.repository;
-    if (!pr) {
-        console.warn('pull_request event missing pull_request payload');
-        return;
-    }
+    if (!pr) return;
 
-    const message =
-        `${repo.full_name} - Pull request ${action}: #${pr.number} ${pr.title}\n` +
-        `By: ${pr.user?.login || 'unknown'}\n` +
-        `View: ${pr.html_url}`;
+    const action = payload.action || 'updated';
+    const title = pr.title || '(no title)';
+    const number = pr.number;
+    const author = pr.user?.login || 'unknown';
+    const htmlUrl = pr.html_url || '';
 
-    console.log('pull_request ->', message);
-    await safeSend(message);
+    const art = randomAnimal();
+
+    const msg =
+        `${art}\n` +
+        `${headerLine('Pull Request', repo?.full_name)}\n` +
+        `Action : ${action}\n` +
+        `#${number}: ${title}\n` +
+        `By     : ${author}\n` +
+        (htmlUrl ? `View   : ${htmlUrl}\n` : '') +
+        SEP;
+
+    await safeSend(send, msg);
 }
 
-async function handleIssue(payload: any) {
-    const action = payload.action || 'unknown';
+async function handleIssue(payload: any, send: (t: string) => Promise<void>) {
     const issue = payload.issue;
     const repo = payload.repository;
-    if (!issue) {
-        console.warn('issues event missing issue payload');
-        return;
-    }
+    if (!issue) return;
 
-    const message =
-        `${repo.full_name} - Issue ${action}: #${issue.number} ${issue.title}\n` +
-        `By: ${issue.user?.login || 'unknown'}\n` +
-        `View: ${issue.html_url}`;
+    const action = payload.action || 'updated';
+    const title = issue.title || '(no title)';
+    const number = issue.number;
+    const author = issue.user?.login || 'unknown';
+    const htmlUrl = issue.html_url || '';
 
-    console.log('issues ->', message);
-    await safeSend(message);
+    const art = randomAnimal();
+
+    const msg =
+        `${art}\n` +
+        `${headerLine('Issue', repo?.full_name)}\n` +
+        `Action : ${action}\n` +
+        `#${number}: ${title}\n` +
+        `By     : ${author}\n` +
+        (htmlUrl ? `View   : ${htmlUrl}\n` : '') +
+        SEP;
+
+    await safeSend(send, msg);
 }
 
-async function handlePush(payload: any) {
+async function handlePush(payload: any, send: (t: string) => Promise<void>) {
     const repo = payload.repository;
     const ref = payload.ref || '';
     const branch = ref.replace('refs/heads/', '') || 'unknown';
@@ -207,25 +342,36 @@ async function handlePush(payload: any) {
     const commits: any[] = payload.commits || [];
     const last = commits[commits.length - 1] || {};
     const commitMsg = last.message || '(no message)';
-    const commitUrl = last.url || `${repo.html_url}/commit/${last.id || ''}`;
+    const commitId = last.id || '';
+    const commitUrl =
+        last.url ||
+        (repo?.html_url && commitId ? `${repo.html_url}/commit/${commitId}` : '');
 
-    const message =
-        `${repo.full_name} - Push to ${branch}\n` +
-        `By: ${pusher}\n` +
-        `Latest: ${commitMsg}\n` +
-        `View: ${commitUrl}`;
+    const art = randomAnimal();
 
-    console.log('push ->', message);
-    await safeSend(message);
+    const msg =
+        `${art}\n` +
+        `${headerLine('⬆️ Push', repo?.full_name)}\n` +
+        `Branch : ${branch}\n` +
+        `By     : ${pusher}\n` +
+        `Latest : ${commitMsg}\n` +
+        (commitUrl ? `View   : ${commitUrl}\n` : '') +
+        SEP;
+
+    await safeSend(send, msg);
 }
 
-/* ---------------- Helpers ---------------- */
+/* ---------------- Fallback for all other GitHub events ---------------- */
 
-async function safeSend(text: string) {
+function buildGenericGithubMessage(event: string | undefined, payload: any) {
+    return `GitHub event: ${event}\nPayload:\n${JSON.stringify(payload, null, 2)}`;
+}
+
+async function safeSend(send: (t: string) => Promise<void>, text: string) {
     try {
-        await mailer.sendMail(text);
+        await send(text);
     } catch (err) {
-        // log but don't crash server
-        console.error('Failed to send Telegram message:', err);
+        console.error('send failed', err);
     }
 }
+
