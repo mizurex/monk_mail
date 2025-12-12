@@ -1,6 +1,6 @@
 # monkmail
 
-A lightweight, zero-dependency Node.js library for sending notifications via **Telegram**, **Gmail**, and handling **GitHub webhooks** with formatted messages.
+Zero-dependency notification library for Node.js
 
 ## Features
 

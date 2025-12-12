@@ -5,14 +5,14 @@ import { SmtpClient, Monkmail } from "../src";
 const SMTP_CONFIG = {
   host: "smtp.gmail.com",
   port: 465,
-  username: "dhananjayadhal3@gmail.com",
-  password: "mefatgodgcomlyty",
-  from: "Viswas Dhal <dhananjayadhal3@gmail.com>",
+  username: process.env.SMTP_USERNAME!,
+  password: process.env.SMTP_PASSWORD!,
+  from: "monkmail <dhananjayadhal3@gmail.com>",
 };
 
 const TELEGRAM_CONFIG = {
-  botToken: "8514650405:AAFzBuEQxw83GnvP3mmTnnKyCFjwmiObB0M",
-  chatId: "1377743400",
+  botToken: process.env.TELEGRAM_BOT_TOKEN!,
+  chatId: process.env.TELEGRAM_CHAT_ID!,
 };
 
 const TEST_DIR = __dirname;
@@ -27,7 +27,7 @@ async function testEmailWithAttachment() {
   const smtp = new SmtpClient(SMTP_CONFIG);
   
   await smtp.send({
-    to: "viswasdhal@gmail.com",
+    to: process.env.SMTP_TO!,
     subject: "Monkmail Test - Attachment",
     body: "This email has an attachment.",
     attachments: [
@@ -47,7 +47,7 @@ async function testEmailWithMultipleAttachments() {
   const smtp = new SmtpClient(SMTP_CONFIG);
   
   await smtp.send({
-    to: "viswasdhal@gmail.com",
+    to: process.env.SMTP_TO!,
     subject: "Monkmail Test - Multiple Attachments",
     body: "This email has multiple attachments.",
     attachments: [

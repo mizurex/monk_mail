@@ -21,15 +21,15 @@ async function sendTwoEmails() {
   const smtpBase = {
     host: "smtp.gmail.com",
     port: 465,
-    username: "dhananjayadhal3@gmail.com",
-    password: "mefatgodgcomlyty",
-    from: "Viswas Dhal <dhananjayadhal3@gmail.com>",
+    username: process.env.SMTP_USERNAME!,
+    password: process.env.SMTP_PASSWORD!,
+    from: "monkmail <dhananjayadhal3@gmail.com>",
   };
 
   // Email 1
   const email1: SmtpPayload = {
     ...smtpBase,
-    to: "viswasdhal@gmail.com",
+    to: process.env.SMTP_TO!,
     subject: "Queue Email #1",
     body: "This is the FIRST email sent via message queue with retry support!",
   };
@@ -39,7 +39,7 @@ async function sendTwoEmails() {
   // Email 2
   const email2: SmtpPayload = {
     ...smtpBase,
-    to: "viswasdhal@gmail.com",
+    to: process.env.SMTP_TO!,
     subject: "Queue Email #2",
     body: "This is the SECOND email sent via message queue with retry support!",
   };
