@@ -4,7 +4,7 @@ A lightweight Node.js library for Telegram notifications, SMTP emails, and GitHu
 
 ## Packages
 
-- **[packages/app](./packages/app)** - Core monkmail library (npm package)
+- **[packages/app](./packages/app)** - Core monkmail library 
 - **[packages/web](./packages/web)** - Documentation website
 
 ## Quick Install
